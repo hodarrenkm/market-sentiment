@@ -1,0 +1,327 @@
+"""
+All data-source fetchers. Each function retries 3× with exponential backoff;
+on final failure it logs and returns None (or raises for callers that treat
+the data as mandatory). The pipeline treats every source as optional except
+GSPC/VIX/SPY/IEF, which are essential.
+
+Seam for exchange breadth: replace get_breadth_series() body with a
+Barchart feed ($MAHN / $MALN / $MAAD etc.) — the return schema
+(DataFrame with columns nh, nl, advances, declines indexed by date) is stable.
+"""
+import io
+import logging
+import time
+import warnings
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).parent.parent
+DATA_DIR = _ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+_SP500_CACHE = DATA_DIR / "sp500_universe.csv"
+_UNIVERSE_TTL_DAYS = 7
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+# CBOE equity put/call — endpoints rotate; try each in order.
+# Mark the sub-indicator null if all fail (spec: never fail the run).
+_CBOE_URLS = [
+    "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_CPCE.json",
+    "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_CPC.json",
+]
+
+
+# ── Retry helper ──────────────────────────────────────────────────────────────
+
+def _retry(fn, retries: int = 3, backoff: float = 2.0):
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                delay = backoff ** attempt
+                logger.warning(
+                    "Attempt %d/%d failed (%s); retrying in %.1fs",
+                    attempt + 1, retries, exc, delay,
+                )
+                time.sleep(delay)
+    raise last_exc
+
+
+# ── yfinance price data ───────────────────────────────────────────────────────
+
+def get_yfinance_prices(tickers: list, period: str = "3y") -> pd.DataFrame:
+    """
+    Adjusted Close prices for the given tickers.
+    Returns a DataFrame indexed by date (tz-naive), one column per ticker.
+    """
+    def _fetch():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw = yf.download(
+                tickers,
+                period=period,
+                group_by="column",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+            )
+        if raw is None or raw.empty:
+            raise ValueError(f"yfinance returned empty data for {tickers}")
+
+        # Normalise to a flat DataFrame with ticker-name columns.
+        # yfinance group_by="column": level-0 = metric, level-1 = ticker.
+        # Older builds may swap the levels — handle both.
+        if isinstance(raw.columns, pd.MultiIndex):
+            lvl0 = raw.columns.get_level_values(0).unique().tolist()
+            lvl1 = raw.columns.get_level_values(1).unique().tolist()
+            if "Close" in lvl0:
+                closes = raw["Close"]
+            elif "Close" in lvl1:
+                closes = raw.xs("Close", axis=1, level=1)
+            else:
+                raise ValueError(f"Cannot locate 'Close' in columns: {raw.columns.tolist()[:10]}")
+            if isinstance(closes, pd.Series):
+                closes = closes.to_frame(name=tickers[0])
+        else:
+            if "Close" in raw.columns:
+                closes = raw[["Close"]].rename(columns={"Close": tickers[0]})
+            else:
+                closes = raw
+
+        closes.index = pd.to_datetime(closes.index)
+        if closes.index.tz is not None:
+            closes.index = closes.index.tz_convert(None)
+        return closes.dropna(how="all")
+
+    return _retry(_fetch)
+
+
+# ── FRED series ───────────────────────────────────────────────────────────────
+
+def get_fred_series(series_id: str) -> pd.Series:
+    """Download a FRED series as a tz-naive daily pd.Series."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+
+    def _fetch():
+        resp = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text), index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert(None)
+        series = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+        return series.sort_index()
+
+    return _retry(_fetch)
+
+
+# ── CBOE put/call ratio (soft failure) ───────────────────────────────────────
+
+def get_cboe_put_call() -> Optional[pd.Series]:
+    """
+    Equity put/call ratio from CBOE CDN.
+    Returns a daily pd.Series or None if every endpoint fails.
+    """
+    for url in _CBOE_URLS:
+        try:
+            resp = requests.get(url, timeout=15, headers=_BROWSER_HEADERS)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # _CPCE / _CPC JSON structure: {"data": [[timestamp_ms, value], ...]}
+            rows = data.get("data", [])
+            if not rows:
+                continue
+
+            df = pd.DataFrame(rows, columns=["ts", "value"])
+            df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(None).dt.normalize()
+            df = df.dropna(subset=["value"]).set_index("date")["value"]
+            df = pd.to_numeric(df, errors="coerce").dropna().sort_index()
+            if df.empty:
+                continue
+            logger.info("CBOE put/call: fetched %d rows from %s", len(df), url)
+            return df
+
+        except Exception as exc:
+            logger.warning("CBOE endpoint %s failed: %s", url, exc)
+
+    logger.warning("All CBOE put/call endpoints unavailable — sub-indicator will be null this run")
+    return None
+
+
+# ── S&P 500 universe ──────────────────────────────────────────────────────────
+
+def get_sp500_universe() -> pd.DataFrame:
+    """
+    Returns a DataFrame with columns [Symbol, Security] for all S&P 500 members.
+    Results are cached in data/sp500_universe.csv and refreshed weekly.
+    """
+    if _SP500_CACHE.exists():
+        cached = pd.read_csv(_SP500_CACHE)
+        cached_date = pd.to_datetime(cached["cached_at"].iloc[0], errors="coerce")
+        age = (pd.Timestamp.now() - cached_date).days
+        if age < _UNIVERSE_TTL_DAYS:
+            logger.info("Using cached S&P 500 universe (%d tickers, %d days old)", len(cached), age)
+            return cached
+
+    def _fetch():
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url, header=0, flavor="lxml")
+        df = tables[0][["Symbol", "Security"]].copy()
+        # Normalise tickers for yfinance (BRK.B → BRK-B)
+        df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
+        df["cached_at"] = pd.Timestamp.now().strftime("%Y-%m-%d")
+        return df
+
+    fresh = _retry(_fetch)
+
+    if _SP500_CACHE.exists():
+        old = pd.read_csv(_SP500_CACHE)
+        added = sorted(set(fresh["Symbol"]) - set(old["Symbol"]))
+        removed = sorted(set(old["Symbol"]) - set(fresh["Symbol"]))
+        if added:
+            logger.info("S&P 500 additions: %s", added)
+        if removed:
+            logger.info("S&P 500 removals: %s", removed)
+
+    fresh.to_csv(_SP500_CACHE, index=False)
+    logger.info("S&P 500 universe refreshed: %d constituents", len(fresh))
+    return fresh
+
+
+# ── S&P 500 breadth (seam) ────────────────────────────────────────────────────
+
+def get_breadth_series() -> pd.DataFrame:
+    """
+    Compute daily NH/NL and advances/declines over the S&P 500 universe.
+
+    Seam: to replace with Barchart ($MAHN/$MALN/$MAAD/$MADC), swap this
+    function body while keeping the return schema:
+        DataFrame indexed by date with integer columns: nh, nl, advances, declines
+
+    Labeled "S&P 500 breadth" throughout the UI — not NYSE — to accurately
+    reflect the proxy nature of this computation.
+    """
+    universe = get_sp500_universe()
+    tickers = universe["Symbol"].tolist()
+    logger.info("Downloading 1y OHLC for %d S&P 500 constituents...", len(tickers))
+
+    def _fetch_panel():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            panel = yf.download(
+                tickers,
+                period="1y",
+                group_by="column",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+            )
+        if panel is None or panel.empty:
+            raise ValueError("yfinance returned empty breadth panel")
+        return panel
+
+    panel = _retry(_fetch_panel, retries=3, backoff=5.0)
+
+    # Extract Close prices (handle both MultiIndex level orderings)
+    if isinstance(panel.columns, pd.MultiIndex):
+        lvl0 = panel.columns.get_level_values(0).unique().tolist()
+        lvl1 = panel.columns.get_level_values(1).unique().tolist()
+        if "Close" in lvl0:
+            closes = panel["Close"]
+        elif "Close" in lvl1:
+            closes = panel.xs("Close", axis=1, level=1)
+        else:
+            raise ValueError("Cannot locate 'Close' in breadth panel columns")
+        if isinstance(closes, pd.Series):
+            closes = closes.to_frame()
+    else:
+        closes = panel
+
+    closes.index = pd.to_datetime(closes.index)
+    if closes.index.tz is not None:
+        closes.index = closes.index.tz_localize(None)
+
+    # Drop tickers with <70% coverage (delistings, late additions)
+    min_obs = int(len(closes) * 0.70)
+    closes = closes.dropna(axis=1, thresh=min_obs)
+    logger.info("Breadth panel: %d tickers × %d days after coverage filter", closes.shape[1], len(closes))
+
+    # Vectorised computation (no Python-level loops over rows)
+    daily_chg = closes.diff()
+    advances = (daily_chg > 0).sum(axis=1).astype(int)
+    declines = (daily_chg < 0).sum(axis=1).astype(int)
+
+    rolling_max = closes.rolling(252, min_periods=1).max()
+    rolling_min = closes.rolling(252, min_periods=1).min()
+    nh_ser = (closes >= rolling_max).sum(axis=1).astype(int)
+    nl_ser = (closes <= rolling_min).sum(axis=1).astype(int)
+
+    # Day 0 has no prior close — zero advances/declines there
+    advances.iloc[0] = 0
+    declines.iloc[0] = 0
+
+    df = pd.DataFrame({
+        "nh": nh_ser,
+        "nl": nl_ser,
+        "advances": advances,
+        "declines": declines,
+    })
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
+# ── CNN Fear & Greed (benchmark only) ────────────────────────────────────────
+
+def get_cnn_fear_greed() -> Optional[float]:
+    """
+    Fetch CNN's current Fear & Greed composite score.
+    Returns float in [0, 100] or None — never a hard dependency.
+    """
+    url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+    try:
+        resp = requests.get(url, timeout=15, headers=_BROWSER_HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+        score = float(data["fear_and_greed"]["score"])
+        logger.info("CNN Fear & Greed score: %.1f", score)
+        return score
+    except Exception as exc:
+        logger.warning("CNN Fear & Greed unavailable: %s", exc)
+        return None
+
+
+# ── Staleness check ───────────────────────────────────────────────────────────
+
+def is_stale(series, name: str, max_bdays: int = 3) -> bool:
+    """Return True if the most recent data point is older than max_bdays business days."""
+    if series is None:
+        return True
+    try:
+        last = pd.to_datetime(series.index[-1] if hasattr(series, "index") else series.name)
+        today = pd.Timestamp.now().normalize()
+        lag = len(pd.bdate_range(start=last + pd.Timedelta(days=1), end=today))
+        if lag > max_bdays:
+            logger.warning("Source '%s' is stale: last datapoint %s (%d bdays ago)", name, last.date(), lag)
+            return True
+    except Exception:
+        pass
+    return False
