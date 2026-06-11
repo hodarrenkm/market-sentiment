@@ -10,6 +10,7 @@ Barchart feed ($MAHN / $MALN / $MAAD etc.) — the return schema
 """
 import io
 import logging
+import random
 import time
 import warnings
 from pathlib import Path
@@ -46,7 +47,7 @@ _CBOE_URLS = [
 
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
-def _retry(fn, retries: int = 3, backoff: float = 2.0):
+def _retry(fn, retries: int = 3, backoff: float = 2.0, max_delay: float = 30.0):
     last_exc: Exception = RuntimeError("no attempts made")
     for attempt in range(retries):
         try:
@@ -54,7 +55,7 @@ def _retry(fn, retries: int = 3, backoff: float = 2.0):
         except Exception as exc:
             last_exc = exc
             if attempt < retries - 1:
-                delay = backoff ** attempt
+                delay = min(backoff ** attempt + random.uniform(0, 1), max_delay)
                 logger.warning(
                     "Attempt %d/%d failed (%s); retrying in %.1fs",
                     attempt + 1, retries, exc, delay,
@@ -63,12 +64,22 @@ def _retry(fn, retries: int = 3, backoff: float = 2.0):
     raise last_exc
 
 
+def _make_yf_session() -> requests.Session:
+    """requests.Session with a browser User-Agent to reduce yfinance rate-limiting."""
+    s = requests.Session()
+    s.headers.update(_BROWSER_HEADERS)
+    return s
+
+
 # ── yfinance price data ───────────────────────────────────────────────────────
 
 def get_yfinance_prices(tickers: list, period: str = "3y") -> pd.DataFrame:
     """
     Adjusted Close prices for the given tickers.
     Returns a DataFrame indexed by date (tz-naive), one column per ticker.
+
+    Core index tickers (^GSPC, ^VIX, SPY, IEF) are fetched here separately
+    from the large constituent batch in get_breadth_series.
     """
     def _fetch():
         with warnings.catch_warnings():
@@ -78,8 +89,9 @@ def get_yfinance_prices(tickers: list, period: str = "3y") -> pd.DataFrame:
                 period=period,
                 group_by="column",
                 auto_adjust=True,
-                threads=True,
+                threads=False,
                 progress=False,
+                session=_make_yf_session(),
             )
         if raw is None or raw.empty:
             raise ValueError(f"yfinance returned empty data for {tickers}")
@@ -109,7 +121,7 @@ def get_yfinance_prices(tickers: list, period: str = "3y") -> pd.DataFrame:
             closes.index = closes.index.tz_convert(None)
         return closes.dropna(how="all")
 
-    return _retry(_fetch)
+    return _retry(_fetch, retries=5, backoff=3.0, max_delay=30.0)
 
 
 # ── FRED series ───────────────────────────────────────────────────────────────
@@ -205,6 +217,76 @@ def get_sp500_universe() -> pd.DataFrame:
     return fresh
 
 
+# ── Batched yfinance close downloader ────────────────────────────────────────
+
+def _download_closes_batched(
+    tickers: list,
+    period: str = "1y",
+    batch_size: int = 25,
+) -> pd.DataFrame:
+    """
+    Download Close prices in batches of ~batch_size tickers with a 2-5 s
+    random pause between batches to avoid GitHub-runner rate-limiting.
+    Each batch retries up to 5× with exponential backoff capped at 30 s.
+    """
+    batches = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
+    all_closes: list = []
+
+    for idx, batch in enumerate(batches):
+        logger.info(
+            "Downloading batch %d/%d (%d tickers)...",
+            idx + 1, len(batches), len(batch),
+        )
+
+        def _fetch_batch(b=batch):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                raw = yf.download(
+                    b,
+                    period=period,
+                    group_by="column",
+                    auto_adjust=True,
+                    threads=False,
+                    progress=False,
+                    session=_make_yf_session(),
+                )
+            if raw is None or raw.empty:
+                raise ValueError(f"Empty response for batch starting {b[:3]}")
+            return raw
+
+        panel = _retry(_fetch_batch, retries=5, backoff=3.0, max_delay=30.0)
+
+        if isinstance(panel.columns, pd.MultiIndex):
+            lvl0 = panel.columns.get_level_values(0).unique().tolist()
+            lvl1 = panel.columns.get_level_values(1).unique().tolist()
+            if "Close" in lvl0:
+                closes = panel["Close"]
+            elif "Close" in lvl1:
+                closes = panel.xs("Close", axis=1, level=1)
+            else:
+                raise ValueError(f"Cannot locate 'Close' in batch {idx + 1} columns")
+            if isinstance(closes, pd.Series):
+                closes = closes.to_frame(name=batch[0])
+        else:
+            if "Close" in panel.columns:
+                closes = panel[["Close"]].rename(columns={"Close": batch[0]})
+            else:
+                closes = panel
+
+        all_closes.append(closes)
+
+        if idx < len(batches) - 1:
+            delay = random.uniform(2.0, 5.0)
+            logger.debug("Batch %d done; pausing %.1fs", idx + 1, delay)
+            time.sleep(delay)
+
+    if not all_closes:
+        raise ValueError("No batches returned Close data")
+
+    combined = pd.concat(all_closes, axis=1)
+    return combined.loc[:, ~combined.columns.duplicated()]
+
+
 # ── S&P 500 breadth (seam) ────────────────────────────────────────────────────
 
 def get_breadth_series() -> pd.DataFrame:
@@ -220,39 +302,12 @@ def get_breadth_series() -> pd.DataFrame:
     """
     universe = get_sp500_universe()
     tickers = universe["Symbol"].tolist()
-    logger.info("Downloading 1y OHLC for %d S&P 500 constituents...", len(tickers))
+    logger.info(
+        "Downloading 1y closes for %d S&P 500 constituents in batches of 25...",
+        len(tickers),
+    )
 
-    def _fetch_panel():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            panel = yf.download(
-                tickers,
-                period="1y",
-                group_by="column",
-                auto_adjust=True,
-                threads=True,
-                progress=False,
-            )
-        if panel is None or panel.empty:
-            raise ValueError("yfinance returned empty breadth panel")
-        return panel
-
-    panel = _retry(_fetch_panel, retries=3, backoff=5.0)
-
-    # Extract Close prices (handle both MultiIndex level orderings)
-    if isinstance(panel.columns, pd.MultiIndex):
-        lvl0 = panel.columns.get_level_values(0).unique().tolist()
-        lvl1 = panel.columns.get_level_values(1).unique().tolist()
-        if "Close" in lvl0:
-            closes = panel["Close"]
-        elif "Close" in lvl1:
-            closes = panel.xs("Close", axis=1, level=1)
-        else:
-            raise ValueError("Cannot locate 'Close' in breadth panel columns")
-        if isinstance(closes, pd.Series):
-            closes = closes.to_frame()
-    else:
-        closes = panel
+    closes = _download_closes_batched(tickers, period="1y", batch_size=25)
 
     closes.index = pd.to_datetime(closes.index)
     if closes.index.tz is not None:
