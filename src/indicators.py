@@ -62,10 +62,6 @@ def score_junk(hy_oas: pd.Series) -> pd.Series:
     return 100.0 - pct_rank_series(hy_oas)
 
 
-def score_put_call(pc_ratio: pd.Series) -> pd.Series:
-    """100 − pct-rank of equity P/C ratio. Low put/call = greed."""
-    return 100.0 - pct_rank_series(pc_ratio)
-
 
 def score_highs_lows(nh: pd.Series, nl: pd.Series) -> pd.Series:
     """Pct-rank of (NH − NL) / (NH + NL). Dominance of new highs = greed."""

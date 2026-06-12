@@ -23,7 +23,6 @@ _SUB_LABELS = {
     "vix":        "Volatility (VIX)",
     "safe_haven": "Safe Haven Demand",
     "junk":       "Junk Bond Demand",
-    "put_call":   "Put/Call Ratio",
     "nh_nl":      "New Highs / New Lows",
     "breadth":    "Stock Breadth (McClellan)",
 }
@@ -33,7 +32,6 @@ _RAW_COL = {
     "vix":        ("vix_close",  "VIX",           ".1f"),
     "safe_haven": ("spy_close",  "SPY price",     ".2f"),
     "junk":       ("hy_oas",     "HY OAS",        ".2f"),
-    "put_call":   ("pc_ratio",   "Equity P/C",    ".2f"),
     "nh_nl":      (None,         "",              ""),
     "breadth":    ("mclellan_osc", "McClellan",   ".1f"),
 }

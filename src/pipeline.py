@@ -98,7 +98,6 @@ def run() -> None:
         sys.exit(1)
 
     hy_series = _safe_fetch(lambda: fetch.get_fred_series("BAMLH0A0HYM2"), "FRED BAMLH0A0HYM2")
-    pc_series = _safe_fetch(fetch.get_cboe_put_call, "CBOE put/call")
     breadth_df = _safe_fetch(fetch.get_breadth_series, "S&P 500 breadth panel")
     cnn_score = _safe_fetch(fetch.get_cnn_fear_greed, "CNN Fear & Greed")
 
@@ -113,7 +112,6 @@ def run() -> None:
     ief = prices["IEF"].reindex(dates) if "IEF" in prices.columns else None
 
     hy_aligned = _align(hy_series, dates, "HY OAS")
-    pc_aligned = _align(pc_series, dates, "put/call") if pc_series is not None else None
     breadth_aligned = (
         breadth_df.reindex(dates, method="ffill")
         if breadth_df is not None else None
@@ -139,11 +137,6 @@ def run() -> None:
     else:
         logger.warning("HY OAS unavailable — junk-bond sub-indicator null")
 
-    if pc_aligned is not None:
-        score_map["put_call"] = indicators.score_put_call(pc_aligned)
-    else:
-        logger.info("P/C ratio null — composite renormalized over remaining components")
-
     mclellan_osc = None
     if breadth_aligned is not None:
         nh = breadth_aligned["nh"].astype(float)
@@ -162,8 +155,6 @@ def run() -> None:
     stale_sources = []
     if fetch.is_stale(hy_series, "FRED HY OAS"):
         stale_sources.append("HY OAS")
-    if fetch.is_stale(pc_series, "CBOE P/C"):
-        stale_sources.append("CBOE P/C")
     if fetch.is_stale(prices, "yfinance"):
         stale_sources.append("prices")
 
@@ -180,8 +171,6 @@ def run() -> None:
         new_rows["ief_close"] = ief
     if hy_aligned is not None:
         new_rows["hy_oas"] = hy_aligned
-    if pc_aligned is not None:
-        new_rows["pc_ratio"] = pc_aligned
 
     if breadth_aligned is not None:
         new_rows["nh"] = breadth_aligned["nh"]

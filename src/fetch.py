@@ -4,6 +4,10 @@ on final failure it logs and returns None (or raises for callers that treat
 the data as mandatory). The pipeline treats every source as optional except
 GSPC/VIX/SPY/IEF, which are essential.
 
+Note: the equity put/call ratio sub-indicator has been permanently removed.
+CBOE CDN endpoints returned 403 and no reliable free alternative exists
+without an API key. The composite renormalizes over the remaining 6 components.
+
 Seam for exchange breadth: replace get_breadth_series() body with a
 Barchart feed ($MAHN / $MALN / $MAAD etc.) — the return schema
 (DataFrame with columns nh, nl, advances, declines indexed by date) is stable.
@@ -36,13 +40,6 @@ _BROWSER_HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-
-# CBOE equity put/call — endpoints rotate; try each in order.
-# Mark the sub-indicator null if all fail (spec: never fail the run).
-_CBOE_URLS = [
-    "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_CPCE.json",
-    "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_CPC.json",
-]
 
 
 # ── Retry helper ──────────────────────────────────────────────────────────────
@@ -131,7 +128,7 @@ def get_fred_series(series_id: str) -> pd.Series:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
 
     def _fetch():
-        resp = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
+        resp = requests.get(url, timeout=60, headers=_BROWSER_HEADERS)
         resp.raise_for_status()
         df = pd.read_csv(io.StringIO(resp.text), index_col=0, parse_dates=True)
         df.index = pd.to_datetime(df.index)
@@ -142,39 +139,6 @@ def get_fred_series(series_id: str) -> pd.Series:
 
     return _retry(_fetch)
 
-
-# ── CBOE put/call ratio (soft failure) ───────────────────────────────────────
-
-def get_cboe_put_call() -> Optional[pd.Series]:
-    """
-    Equity put/call ratio from CBOE CDN.
-    Returns a daily pd.Series or None if every endpoint fails.
-    """
-    for url in _CBOE_URLS:
-        try:
-            resp = requests.get(url, timeout=15, headers=_BROWSER_HEADERS)
-            resp.raise_for_status()
-            data = resp.json()
-
-            # _CPCE / _CPC JSON structure: {"data": [[timestamp_ms, value], ...]}
-            rows = data.get("data", [])
-            if not rows:
-                continue
-
-            df = pd.DataFrame(rows, columns=["ts", "value"])
-            df["date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(None).dt.normalize()
-            df = df.dropna(subset=["value"]).set_index("date")["value"]
-            df = pd.to_numeric(df, errors="coerce").dropna().sort_index()
-            if df.empty:
-                continue
-            logger.info("CBOE put/call: fetched %d rows from %s", len(df), url)
-            return df
-
-        except Exception as exc:
-            logger.warning("CBOE endpoint %s failed: %s", url, exc)
-
-    logger.warning("All CBOE put/call endpoints unavailable — sub-indicator will be null this run")
-    return None
 
 
 # ── S&P 500 universe ──────────────────────────────────────────────────────────
@@ -194,7 +158,9 @@ def get_sp500_universe() -> pd.DataFrame:
 
     def _fetch():
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url, header=0, flavor="lxml")
+        resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=30)
+        resp.raise_for_status()
+        tables = pd.read_html(io.StringIO(resp.text), header=0, flavor="lxml")
         df = tables[0][["Symbol", "Security"]].copy()
         # Normalise tickers for yfinance (BRK.B → BRK-B)
         df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
