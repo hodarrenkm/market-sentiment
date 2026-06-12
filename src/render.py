@@ -186,6 +186,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Market Sentiment Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
 :root {
   --bg: #f7f8fa;
@@ -267,7 +269,16 @@ body {
 .card-raw { font-size: 0.68rem; color: var(--muted); }
 
 /* ── Chart tabs ── */
-.tab-row { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.tab-area { margin-bottom: 0.75rem; }
+.tab-row { display: flex; gap: 0.35rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.4rem; }
+.reset-zoom-btn {
+  margin-left: auto; padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border); border-radius: 20px;
+  background: var(--surface); color: var(--muted);
+  cursor: pointer; font-size: 0.72rem; font-family: inherit;
+  display: none;
+}
+.reset-zoom-btn.visible { display: inline-block; }
 .tab-btn {
   padding: 0.35rem 0.85rem;
   border: 1px solid var(--border);
@@ -330,15 +341,18 @@ footer {
 <div class="cards-grid">__CARDS_HTML__
 </div>
 
-<div class="tab-row">
-  <button class="tab-btn active" onclick="showTab('composite',this)">Composite</button>
-  <button class="tab-btn" onclick="showTab('momentum',this)">Momentum</button>
-  <button class="tab-btn" onclick="showTab('vix',this)">Volatility</button>
-  <button class="tab-btn" onclick="showTab('safe_haven',this)">Safe Haven</button>
-  <button class="tab-btn" onclick="showTab('junk',this)">Credit</button>
-  <button class="tab-btn" onclick="showTab('nh_nl',this)">New Highs−Lows</button>
-  <button class="tab-btn" onclick="showTab('ad_line',this)">A/D Line</button>
-  <button class="tab-btn" onclick="showTab('mclellan',this)">McClellan</button>
+<div class="tab-area">
+  <div class="tab-row">
+    <button class="tab-btn active" onclick="showTab('composite',this)">Composite</button>
+    <button class="tab-btn" onclick="showTab('momentum',this)">Momentum</button>
+    <button class="tab-btn" onclick="showTab('vix',this)">Volatility</button>
+    <button class="tab-btn" onclick="showTab('safe_haven',this)">Safe Haven</button>
+    <button class="tab-btn" onclick="showTab('junk',this)">Credit</button>
+    <button class="tab-btn" onclick="showTab('nh_nl',this)">New Highs−Lows</button>
+    <button class="tab-btn" onclick="showTab('ad_line',this)">A/D Line</button>
+    <button class="tab-btn" onclick="showTab('mclellan',this)">McClellan</button>
+    <button class="reset-zoom-btn" id="reset-zoom-btn" onclick="resetActiveZoom()">Reset zoom</button>
+  </div>
 </div>
 <div id="tab-composite"  class="chart-panel active"><canvas id="compositeChart"></canvas></div>
 <div id="tab-momentum"   class="chart-panel"><canvas id="momentumChart"></canvas></div>
@@ -526,14 +540,24 @@ document.getElementById('slider-section').style.display = '';
 // ── Charts ────────────────────────────────────────────────────────────────────
 const activeCharts = {};
 
+const zoomOpts = {
+  zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x',
+    onZoom: () => document.getElementById('reset-zoom-btn').classList.add('visible') },
+  pan: { enabled: true, mode: 'x',
+    onPan: () => document.getElementById('reset-zoom-btn').classList.add('visible') },
+};
+
 function mkLine(canvasId, datasets, yLabel) {
   const ctx = document.getElementById(canvasId).getContext('2d');
   const chart = new Chart(ctx, {
     type: 'line',
     data: { labels: DATES, datasets },
     options: {
-      responsive: true, animation: false, parsing: false, spanGaps: true,
-      plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 11 } } } },
+      responsive: true, animation: false, spanGaps: true,
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 10, font: { size: 11 } } },
+        zoom: zoomOpts,
+      },
       scales: {
         x: { type: 'category', ticks: { maxTicksLimit: 8, maxRotation: 0, font: { size: 11 } } },
         y: { title: { display: !!yLabel, text: yLabel, font: { size: 11 } }, ticks: { font: { size: 11 } } },
@@ -551,7 +575,10 @@ function mkBar(canvasId, datasets, yLabel) {
     data: { labels: DATES, datasets },
     options: {
       responsive: true, animation: false,
-      plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 11 } } } },
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 10, font: { size: 11 } } },
+        zoom: zoomOpts,
+      },
       scales: {
         x: { ticks: { maxTicksLimit: 8, maxRotation: 0, font: { size: 11 } } },
         y: { title: { display: !!yLabel, text: yLabel, font: { size: 11 } }, ticks: { font: { size: 11 } } },
@@ -656,11 +683,22 @@ function buildChart(id) {
   }
 }
 
+let activeTabId = 'composite';
+
+function resetActiveZoom() {
+  if (activeCharts[activeTabId]) {
+    activeCharts[activeTabId].resetZoom();
+    document.getElementById('reset-zoom-btn').classList.remove('visible');
+  }
+}
+
 function showTab(id, btn) {
   document.querySelectorAll('.chart-panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   btn.classList.add('active');
+  activeTabId = id;
+  document.getElementById('reset-zoom-btn').classList.remove('visible');
   buildChart(id);
   if (activeCharts[id]) {
     activeCharts[id]._vLineIdx = parseInt(slider.value);
