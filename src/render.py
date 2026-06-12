@@ -541,9 +541,9 @@ document.getElementById('slider-section').style.display = '';
 const activeCharts = {};
 
 const zoomOpts = {
-  zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x',
+  zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'xy',
     onZoom: () => document.getElementById('reset-zoom-btn').classList.add('visible') },
-  pan: { enabled: true, mode: 'x',
+  pan: { enabled: true, mode: 'xy',
     onPan: () => document.getElementById('reset-zoom-btn').classList.add('visible') },
 };
 
