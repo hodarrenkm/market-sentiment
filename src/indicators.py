@@ -57,9 +57,11 @@ def score_safe_haven(spy_closes: pd.Series, ief_closes: pd.Series) -> pd.Series:
     return pct_rank_series(diff)
 
 
-def score_junk(hy_oas: pd.Series) -> pd.Series:
-    """100 − pct-rank of HY OAS. Tight spreads = greed."""
-    return 100.0 - pct_rank_series(hy_oas)
+def score_junk_credit(hyg: pd.Series, lqd: pd.Series) -> pd.Series:
+    """Pct-rank of HYG 20-day return minus LQD 20-day return.
+    HY bonds outperforming IG = tight credit conditions = greed."""
+    diff = hyg.pct_change(20) - lqd.pct_change(20)
+    return pct_rank_series(diff)
 
 
 

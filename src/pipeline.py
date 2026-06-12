@@ -90,14 +90,13 @@ def run() -> None:
 
     # ── Fetch ──────────────────────────────────────────────────────────────────
     prices = _safe_fetch(
-        lambda: fetch.get_yfinance_prices(["^GSPC", "^VIX", "SPY", "IEF"], period="3y"),
-        "yfinance ^GSPC/^VIX/SPY/IEF",
+        lambda: fetch.get_yfinance_prices(["^GSPC", "^VIX", "SPY", "IEF", "HYG", "LQD"], period="3y"),
+        "yfinance ^GSPC/^VIX/SPY/IEF/HYG/LQD",
     )
     if prices is None or prices.empty:
         logger.critical("Cannot proceed without price data — aborting")
         sys.exit(1)
 
-    hy_series = _safe_fetch(lambda: fetch.get_fred_series("BAMLH0A0HYM2"), "FRED BAMLH0A0HYM2")
     breadth_df = _safe_fetch(fetch.get_breadth_series, "S&P 500 breadth panel")
     cnn_score = _safe_fetch(fetch.get_cnn_fear_greed, "CNN Fear & Greed")
 
@@ -110,8 +109,9 @@ def run() -> None:
     vix = prices["^VIX"].reindex(dates) if "^VIX" in prices.columns else None
     spy = prices["SPY"].reindex(dates) if "SPY" in prices.columns else None
     ief = prices["IEF"].reindex(dates) if "IEF" in prices.columns else None
+    hyg = prices["HYG"].reindex(dates) if "HYG" in prices.columns else None
+    lqd = prices["LQD"].reindex(dates) if "LQD" in prices.columns else None
 
-    hy_aligned = _align(hy_series, dates, "HY OAS")
     breadth_aligned = (
         breadth_df.reindex(dates, method="ffill")
         if breadth_df is not None else None
@@ -132,10 +132,10 @@ def run() -> None:
     else:
         logger.warning("SPY/IEF unavailable — safe-haven sub-indicator null")
 
-    if hy_aligned is not None:
-        score_map["junk"] = indicators.score_junk(hy_aligned)
+    if hyg is not None and lqd is not None:
+        score_map["junk"] = indicators.score_junk_credit(hyg, lqd)
     else:
-        logger.warning("HY OAS unavailable — junk-bond sub-indicator null")
+        logger.warning("HYG/LQD unavailable — junk-bond sub-indicator null")
 
     mclellan_osc = None
     if breadth_aligned is not None:
@@ -153,8 +153,6 @@ def run() -> None:
 
     # ── Staleness flags ────────────────────────────────────────────────────────
     stale_sources = []
-    if fetch.is_stale(hy_series, "FRED HY OAS"):
-        stale_sources.append("HY OAS")
     if fetch.is_stale(prices, "yfinance"):
         stale_sources.append("prices")
 
@@ -169,8 +167,10 @@ def run() -> None:
         new_rows["spy_close"] = spy
     if ief is not None:
         new_rows["ief_close"] = ief
-    if hy_aligned is not None:
-        new_rows["hy_oas"] = hy_aligned
+    if hyg is not None:
+        new_rows["hyg_close"] = hyg
+    if lqd is not None:
+        new_rows["lqd_close"] = lqd
 
     if breadth_aligned is not None:
         new_rows["nh"] = breadth_aligned["nh"]

@@ -22,7 +22,7 @@ _SUB_LABELS = {
     "momentum":   "Market Momentum",
     "vix":        "Volatility (VIX)",
     "safe_haven": "Safe Haven Demand",
-    "junk":       "Junk Bond Demand",
+    "junk":       "Credit Demand (HYG/LQD)",
     "nh_nl":      "New Highs / New Lows",
     "breadth":    "Stock Breadth (McClellan)",
 }
@@ -31,7 +31,7 @@ _RAW_COL = {
     "momentum":   ("gspc_close", "S&P 500 close", ".0f"),
     "vix":        ("vix_close",  "VIX",           ".1f"),
     "safe_haven": ("spy_close",  "SPY price",     ".2f"),
-    "junk":       ("hy_oas",     "HY OAS",        ".2f"),
+    "junk":       ("hyg_close",  "HYG",           ".2f"),
     "nh_nl":      (None,         "",              ""),
     "breadth":    ("mclellan_osc", "McClellan",   ".1f"),
 }

@@ -121,24 +121,6 @@ def get_yfinance_prices(tickers: list, period: str = "3y") -> pd.DataFrame:
     return _retry(_fetch, retries=5, backoff=3.0, max_delay=30.0)
 
 
-# ── FRED series ───────────────────────────────────────────────────────────────
-
-def get_fred_series(series_id: str) -> pd.Series:
-    """Download a FRED series as a tz-naive daily pd.Series."""
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-
-    def _fetch():
-        resp = requests.get(url, timeout=60, headers=_BROWSER_HEADERS)
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text), index_col=0, parse_dates=True)
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert(None)
-        series = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
-        return series.sort_index()
-
-    return _retry(_fetch)
-
 
 
 # ── S&P 500 universe ──────────────────────────────────────────────────────────
